@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from functools import lru_cache
 from typing import Any, Literal, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
@@ -23,8 +24,8 @@ from pydantic import BaseModel, Field
 from backend.app.schemas import ChatMessage
 from backend.app.services.pinecone_utils import search_books
 
-EXTRACT_MODEL = "gpt-4o-mini"
-ANSWER_MODEL = "gpt-4o"
+EXTRACT_MODEL = "gpt-5.4-nano"
+ANSWER_MODEL = "gpt-5.4-mini"
 
 TOP_K = 15
 MAX_RECOMMENDATIONS = 6
@@ -53,7 +54,9 @@ class SearchSpec(BaseModel):
     )
     languages: list[str] = Field(
         default_factory=list,
-        description="ISO 639-1 codes, only when the user constrains language, e.g. 'in French' -> ['fr'].",
+        description=(
+            "ISO 639-1 codes, only when the user constrains language, e.g. 'in French' -> ['fr']."
+        ),
     )
     year_from: int | None = Field(
         default=None, description="Earliest first-publication year, only if explicitly constrained."
@@ -71,6 +74,7 @@ class AgentState(TypedDict):
     spec: SearchSpec | None
     attempt: int
     dropped_filters: list[str]
+    unfiltered: bool
     results: list[dict[str, Any]]
 
 
@@ -122,8 +126,16 @@ NO_RESULTS_MESSAGE = (
 
 
 def _to_lc_messages(messages: list[ChatMessage]) -> list[BaseMessage]:
-    mapping = {"user": HumanMessage, "assistant": AIMessage, "system": SystemMessage}
+    # Client-supplied "system" messages are demoted to user content: only the
+    # agent's own prompts may carry system authority.
+    mapping = {"user": HumanMessage, "assistant": AIMessage, "system": HumanMessage}
     return [mapping[m.role](content=m.content) for m in messages]
+
+
+@lru_cache(maxsize=None)
+def _chat_model(model: str, temperature: float) -> ChatOpenAI:
+    """Shared clients, created lazily so the module imports without an API key."""
+    return ChatOpenAI(model=model, temperature=temperature)
 
 
 def _build_filters(spec: SearchSpec, attempt: int) -> tuple[dict[str, Any] | None, list[str]]:
@@ -180,7 +192,7 @@ def _format_books(matches: list[dict[str, Any]]) -> str:
 
 
 async def extract(state: AgentState) -> dict[str, Any]:
-    llm = ChatOpenAI(model=EXTRACT_MODEL, temperature=0).with_structured_output(SearchSpec)
+    llm = _chat_model(EXTRACT_MODEL, 0.0).with_structured_output(SearchSpec)
     spec = await llm.ainvoke([SystemMessage(content=EXTRACT_PROMPT), *state["history"]])
     return {"spec": spec, "attempt": 0}
 
@@ -194,11 +206,21 @@ async def search(state: AgentState) -> dict[str, Any]:
     results = await asyncio.to_thread(
         search_books, query_text=spec.semantic_query, filters=filters, top_k=TOP_K
     )
-    return {"results": results, "dropped_filters": dropped}
+    return {"results": results, "dropped_filters": dropped, "unfiltered": filters is None}
 
 
 def relax(state: AgentState) -> dict[str, Any]:
-    return {"attempt": state["attempt"] + 1}
+    """Advance to the next attempt whose filter set actually differs — a rung that
+    would only drop absent filters would resend the identical query."""
+    spec = state["spec"]
+    assert spec is not None
+    attempt = state["attempt"]
+    current, _ = _build_filters(spec, attempt)
+    while attempt < MAX_RELAX_ATTEMPTS:
+        attempt += 1
+        if _build_filters(spec, attempt)[0] != current:
+            break
+    return {"attempt": attempt}
 
 
 def rerank(state: AgentState) -> dict[str, Any]:
@@ -222,13 +244,13 @@ async def respond(state: AgentState) -> dict[str, Any]:
             "be transparent that these are the closest alternatives.\n"
         )
     system = ANSWER_PROMPT.format(books=_format_books(state["results"]), caveat=caveat)
-    llm = ChatOpenAI(model=ANSWER_MODEL, temperature=0.4)
+    llm = _chat_model(ANSWER_MODEL, 0.4)
     await llm.ainvoke([SystemMessage(content=system), *state["history"]])
     return {}
 
 
 async def smalltalk(state: AgentState) -> dict[str, Any]:
-    llm = ChatOpenAI(model=ANSWER_MODEL, temperature=0.7)
+    llm = _chat_model(ANSWER_MODEL, 0.7)
     await llm.ainvoke([SystemMessage(content=SMALLTALK_PROMPT), *state["history"]])
     return {}
 
@@ -249,7 +271,9 @@ def route_after_extract(state: AgentState) -> Literal["search", "smalltalk"]:
 def route_after_search(state: AgentState) -> Literal["rerank", "relax", "no_results"]:
     if state["results"]:
         return "rerank"
-    if state["attempt"] >= MAX_RELAX_ATTEMPTS:
+    # Retrying an unfiltered search would send the identical query again; give up
+    # as soon as one runs empty (the attempt guard is a termination backstop).
+    if state["unfiltered"] or state["attempt"] >= MAX_RELAX_ATTEMPTS:
         return "no_results"
     return "relax"
 
@@ -285,6 +309,7 @@ async def stream_book_agent_response(messages: list[ChatMessage]) -> AsyncIterat
         "spec": None,
         "attempt": 0,
         "dropped_filters": [],
+        "unfiltered": False,
         "results": [],
     }
     try:
