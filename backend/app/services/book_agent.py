@@ -1,11 +1,8 @@
 """Book recommendation agent.
 
-LangGraph StateGraph pipeline over the Pinecone `books` index:
-
-    extract -> search -> (relax -> search)* -> rerank -> respond
-                \\-> smalltalk                    \\-> no_results
-
-Recommendations are grounded strictly in retrieved index results.
+A small LangGraph pipeline over the Pinecone books index: pull search filters
+out of the conversation, retrieve and rerank matches, then stream an answer
+that only mentions books we actually retrieved.
 """
 
 from __future__ import annotations
@@ -29,9 +26,8 @@ ANSWER_MODEL = "gpt-5.4-mini"
 
 TOP_K = 15
 MAX_RECOMMENDATIONS = 6
-MAX_RELAX_ATTEMPTS = 3  # attempt 0 = all filters ... attempt 3 = unfiltered
+MAX_RELAX_ATTEMPTS = 3  # 0 = all filters, 3 = none
 
-# Only tokens produced inside these nodes are streamed to the user.
 STREAMED_NODES = {"respond", "smalltalk"}
 
 
@@ -103,7 +99,7 @@ They were retrieved from the catalog for this specific request:
 
 Rules:
 - Recommend the 3-5 best matches for the user's request. Format each as
-  **Title** — Author (year if known), followed by 1-2 sentences on why it fits
+  **Title** - Author (year if known), followed by 1-2 sentences on why it fits
   THIS request, grounded in the summary and subjects above.
 - Never mention, invent, or allude to any book outside the list.
 - If nothing above truly fits, say so honestly and present the closest options as such.
@@ -118,7 +114,7 @@ they might enjoy. Do not name or recommend any specific book.
 """
 
 NO_RESULTS_MESSAGE = (
-    "I couldn't find any books in the catalog matching that request — even after "
+    "I couldn't find any books in the catalog matching that request, even after "
     "relaxing the filters. The catalog holds ~1000 classic Project Gutenberg "
     "titles, so try different topic words, or drop the author/language/year "
     "constraint."
@@ -126,21 +122,19 @@ NO_RESULTS_MESSAGE = (
 
 
 def _to_lc_messages(messages: list[ChatMessage]) -> list[BaseMessage]:
-    # Client-supplied "system" messages are demoted to user content: only the
-    # agent's own prompts may carry system authority.
+    # treat any client-sent "system" message as plain user text, not an instruction
     mapping = {"user": HumanMessage, "assistant": AIMessage, "system": HumanMessage}
     return [mapping[m.role](content=m.content) for m in messages]
 
 
 @lru_cache(maxsize=None)
 def _chat_model(model: str, temperature: float) -> ChatOpenAI:
-    """Shared clients, created lazily so the module imports without an API key."""
     return ChatOpenAI(model=model, temperature=temperature)
 
 
 def _build_filters(spec: SearchSpec, attempt: int) -> tuple[dict[str, Any] | None, list[str]]:
-    """Progressively relax filters: year drops first (field is missing on some
-    docs), then language, then author (the user's most intentional constraint)."""
+    # higher attempt = fewer filters. year drops first (it's missing on a lot of
+    # the books), then language, then author.
     filters: dict[str, Any] = {}
     dropped: list[str] = []
 
@@ -179,7 +173,7 @@ def _format_books(matches: list[dict[str, Any]]) -> str:
         downloads = int(md.get("download_count") or 0)
         summary = (md.get("chunk_text") or "").replace("\n", " ").strip()[:500]
         lines.append(
-            f'{i}. "{md.get("title", "Untitled")}" — {authors} '
+            f'{i}. "{md.get("title", "Untitled")}" - {authors} '
             f"(language: {', '.join(md.get('languages') or ['?'])}{year_note}, "
             f"{downloads} downloads, relevance {match['score']:.3f})\n"
             f"   Subjects: {subjects}\n"
@@ -201,7 +195,7 @@ async def search(state: AgentState) -> dict[str, Any]:
     spec = state["spec"]
     assert spec is not None
     if state["attempt"] == 0:
-        get_stream_writer()("_Searching the catalog…_\n\n")
+        get_stream_writer()("_Searching the catalog..._\n\n")
     filters, dropped = _build_filters(spec, state["attempt"])
     results = await asyncio.to_thread(
         search_books, query_text=spec.semantic_query, filters=filters, top_k=TOP_K
@@ -210,8 +204,8 @@ async def search(state: AgentState) -> dict[str, Any]:
 
 
 def relax(state: AgentState) -> dict[str, Any]:
-    """Advance to the next attempt whose filter set actually differs — a rung that
-    would only drop absent filters would resend the identical query."""
+    # jump to the next attempt that actually changes the filters - dropping a
+    # filter the spec never set would just repeat the same search
     spec = state["spec"]
     assert spec is not None
     attempt = state["attempt"]
@@ -271,8 +265,7 @@ def route_after_extract(state: AgentState) -> Literal["search", "smalltalk"]:
 def route_after_search(state: AgentState) -> Literal["rerank", "relax", "no_results"]:
     if state["results"]:
         return "rerank"
-    # Retrying an unfiltered search would send the identical query again; give up
-    # as soon as one runs empty (the attempt guard is a termination backstop).
+    # an unfiltered search that came back empty won't do any better on a retry
     if state["unfiltered"] or state["attempt"] >= MAX_RELAX_ATTEMPTS:
         return "no_results"
     return "relax"
@@ -316,7 +309,7 @@ async def stream_book_agent_response(messages: list[ChatMessage]) -> AsyncIterat
         async for mode, payload in GRAPH.astream(state, stream_mode=["custom", "messages"]):
             if mode == "custom":
                 yield str(payload)
-            else:  # "messages": (message_chunk, metadata)
+            else:
                 chunk, metadata = payload
                 if (
                     metadata.get("langgraph_node") in STREAMED_NODES
@@ -324,5 +317,5 @@ async def stream_book_agent_response(messages: list[ChatMessage]) -> AsyncIterat
                     and chunk.content
                 ):
                     yield chunk.content
-    except Exception as exc:  # SSE protocol has no error frame — surface as text
-        yield f"\n\n⚠️ Something went wrong while generating recommendations: {exc}"
+    except Exception as exc:  # no error frame in SSE, so send it back as text
+        yield f"\n\nSomething went wrong while generating recommendations: {exc}"
