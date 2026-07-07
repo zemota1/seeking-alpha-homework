@@ -122,6 +122,7 @@ NO_RESULTS_MESSAGE = (
 
 
 def _to_lc_messages(messages: list[ChatMessage]) -> list[BaseMessage]:
+    """Convert the API chat messages into LangChain message objects."""
     # treat any client-sent "system" message as plain user text, not an instruction
     mapping = {"user": HumanMessage, "assistant": AIMessage, "system": HumanMessage}
     return [mapping[m.role](content=m.content) for m in messages]
@@ -129,10 +130,12 @@ def _to_lc_messages(messages: list[ChatMessage]) -> list[BaseMessage]:
 
 @lru_cache(maxsize=None)
 def _chat_model(model: str, temperature: float) -> ChatOpenAI:
+    """Build and cache a chat client for a model/temperature pair."""
     return ChatOpenAI(model=model, temperature=temperature)
 
 
 def _build_filters(spec: SearchSpec, attempt: int) -> tuple[dict[str, Any] | None, list[str]]:
+    """Build the Pinecone filter for this attempt, and note any dropped ones."""
     # higher attempt = fewer filters. year drops first (it's missing on a lot of
     # the books), then language, then author.
     filters: dict[str, Any] = {}
@@ -163,6 +166,7 @@ def _build_filters(spec: SearchSpec, attempt: int) -> tuple[dict[str, Any] | Non
 
 
 def _format_books(matches: list[dict[str, Any]]) -> str:
+    """Render the matches into the numbered list the answer prompt sees."""
     lines = []
     for i, match in enumerate(matches, 1):
         md = match["metadata"]
@@ -186,12 +190,14 @@ def _format_books(matches: list[dict[str, Any]]) -> str:
 
 
 async def extract(state: AgentState) -> dict[str, Any]:
+    """Parse the conversation into a SearchSpec."""
     llm = _chat_model(EXTRACT_MODEL, 0.0).with_structured_output(SearchSpec)
     spec = await llm.ainvoke([SystemMessage(content=EXTRACT_PROMPT), *state["history"]])
     return {"spec": spec, "attempt": 0}
 
 
 async def search(state: AgentState) -> dict[str, Any]:
+    """Run the catalog search for the current attempt's filters."""
     spec = state["spec"]
     assert spec is not None
     if state["attempt"] == 0:
@@ -204,6 +210,7 @@ async def search(state: AgentState) -> dict[str, Any]:
 
 
 def relax(state: AgentState) -> dict[str, Any]:
+    """Advance to the next attempt that changes the filter set."""
     # jump to the next attempt that actually changes the filters - dropping a
     # filter the spec never set would just repeat the same search
     spec = state["spec"]
@@ -218,6 +225,7 @@ def relax(state: AgentState) -> dict[str, Any]:
 
 
 def rerank(state: AgentState) -> dict[str, Any]:
+    """Sort by score, drop duplicate titles, keep the top few."""
     seen: set[str] = set()
     unique: list[dict[str, Any]] = []
     for match in sorted(state["results"], key=lambda m: m["score"], reverse=True):
@@ -230,6 +238,7 @@ def rerank(state: AgentState) -> dict[str, Any]:
 
 
 async def respond(state: AgentState) -> dict[str, Any]:
+    """Stream the recommendation answer, grounded in the retrieved books."""
     caveat = ""
     if state["dropped_filters"]:
         constraints = " and ".join(state["dropped_filters"])
@@ -244,12 +253,14 @@ async def respond(state: AgentState) -> dict[str, Any]:
 
 
 async def smalltalk(state: AgentState) -> dict[str, Any]:
+    """Reply to non-book messages and nudge back toward books."""
     llm = _chat_model(ANSWER_MODEL, 0.7)
     await llm.ainvoke([SystemMessage(content=SMALLTALK_PROMPT), *state["history"]])
     return {}
 
 
 def no_results(state: AgentState) -> dict[str, Any]:
+    """Send the fallback message when the search turns up nothing."""
     get_stream_writer()(NO_RESULTS_MESSAGE)
     return {}
 
@@ -258,11 +269,13 @@ def no_results(state: AgentState) -> dict[str, Any]:
 
 
 def route_after_extract(state: AgentState) -> Literal["search", "smalltalk"]:
+    """Send book requests to search, everything else to smalltalk."""
     spec = state["spec"]
     return "search" if spec is not None and spec.is_book_request else "smalltalk"
 
 
 def route_after_search(state: AgentState) -> Literal["rerank", "relax", "no_results"]:
+    """Route on the search outcome: rank hits, relax, or give up."""
     if state["results"]:
         return "rerank"
     # an unfiltered search that came back empty won't do any better on a retry
@@ -272,6 +285,7 @@ def route_after_search(state: AgentState) -> Literal["rerank", "relax", "no_resu
 
 
 def _build_graph():
+    """Wire up and compile the LangGraph state machine."""
     graph = StateGraph(AgentState)
     graph.add_node("extract", extract)
     graph.add_node("search", search)
